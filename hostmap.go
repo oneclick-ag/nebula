@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,6 @@ const defaultPromoteEvery = 1000       // Count of packets sent before we try mo
 const defaultReQueryEvery = 5000       // Count of packets sent before re-querying a hostinfo to the lighthouse
 const defaultReQueryWait = time.Minute // Minimum amount of seconds to wait before re-querying a hostinfo the lighthouse. Evaluated every ReQueryEvery
 const MaxRemotes = 10
-const maxRecvError = 4
 
 // MaxHostInfosPerVpnIp is the max number of hostinfos we will track for a given vpn ip
 // 5 allows for an initial handshake and each host pair re-handshaking twice
@@ -35,6 +35,7 @@ const (
 	Requested = iota
 	PeerRequested
 	Established
+	Disestablished
 )
 
 const (
@@ -68,15 +69,42 @@ type HostMap struct {
 type RelayState struct {
 	sync.RWMutex
 
-	relays        map[netip.Addr]struct{} // Set of VpnIp's of Hosts to use as relays to access this peer
-	relayForByIp  map[netip.Addr]*Relay   // Maps VpnIps of peers for which this HostInfo is a relay to some Relay info
-	relayForByIdx map[uint32]*Relay       // Maps a local index to some Relay info
+	relays        []netip.Addr          // Ordered set of VpnIp's of Hosts to use as relays to access this peer
+	relayForByIp  map[netip.Addr]*Relay // Maps VpnIps of peers for which this HostInfo is a relay to some Relay info
+	relayForByIdx map[uint32]*Relay     // Maps a local index to some Relay info
 }
 
 func (rs *RelayState) DeleteRelay(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
-	delete(rs.relays, ip)
+	for idx, val := range rs.relays {
+		if val == ip {
+			rs.relays = append(rs.relays[:idx], rs.relays[idx+1:]...)
+			return
+		}
+	}
+}
+
+func (rs *RelayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
+	rs.Lock()
+	defer rs.Unlock()
+	if r, ok := rs.relayForByIp[vpnIp]; ok {
+		newRelay := *r
+		newRelay.State = state
+		rs.relayForByIp[newRelay.PeerIp] = &newRelay
+		rs.relayForByIdx[newRelay.LocalIndex] = &newRelay
+	}
+}
+
+func (rs *RelayState) UpdateRelayForByIdxState(idx uint32, state int) {
+	rs.Lock()
+	defer rs.Unlock()
+	if r, ok := rs.relayForByIdx[idx]; ok {
+		newRelay := *r
+		newRelay.State = state
+		rs.relayForByIp[newRelay.PeerIp] = &newRelay
+		rs.relayForByIdx[newRelay.LocalIndex] = &newRelay
+	}
 }
 
 func (rs *RelayState) CopyAllRelayFor() []*Relay {
@@ -99,16 +127,16 @@ func (rs *RelayState) GetRelayForByIp(ip netip.Addr) (*Relay, bool) {
 func (rs *RelayState) InsertRelayTo(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
-	rs.relays[ip] = struct{}{}
+	if !slices.Contains(rs.relays, ip) {
+		rs.relays = append(rs.relays, ip)
+	}
 }
 
 func (rs *RelayState) CopyRelayIps() []netip.Addr {
+	ret := make([]netip.Addr, len(rs.relays))
 	rs.RLock()
 	defer rs.RUnlock()
-	ret := make([]netip.Addr, 0, len(rs.relays))
-	for ip := range rs.relays {
-		ret = append(ret, ip)
-	}
+	copy(ret, rs.relays)
 	return ret
 }
 
@@ -191,7 +219,6 @@ type HostInfo struct {
 	remoteIndexId   uint32
 	localIndexId    uint32
 	vpnIp           netip.Addr
-	recvError       atomic.Uint32
 	remoteCidr      *bart.Table[struct{}]
 	relayState      RelayState
 
@@ -219,6 +246,14 @@ type HostInfo struct {
 	// Used to track other hostinfos for this vpn ip since only 1 can be primary
 	// Synchronised via hostmap lock and not the hostinfo lock.
 	next, prev *HostInfo
+
+	//TODO: in, out, and others might benefit from being an atomic.Int32. We could collapse connectionManager pendingDeletion, relayUsed, and in/out into this 1 thing
+	in, out, pendingDeletion atomic.Bool
+
+	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
+	// This value will be behind against actual tunnel utilization in the hot path.
+	// This should only be used by the ConnectionManagers ticker routine.
+	lastUsed time.Time
 }
 
 type ViaSender struct {
@@ -361,6 +396,7 @@ func (hm *HostMap) unlockedMakePrimary(hostinfo *HostInfo) {
 
 func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) {
 	primary, ok := hm.Hosts[hostinfo.vpnIp]
+	isLastHostinfo := hostinfo.next == nil && hostinfo.prev == nil
 	if ok && primary == hostinfo {
 		// The vpnIp pointer points to the same hostinfo as the local index id, we can remove it
 		delete(hm.Hosts, hostinfo.vpnIp)
@@ -410,6 +446,12 @@ func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) {
 			Debug("Hostmap hostInfo deleted")
 	}
 
+	if isLastHostinfo {
+		// I have lost connectivity to my peers. My relay tunnel is likely broken. Mark the next
+		// hops as 'Disestablished' so that new relay tunnels are created in the future.
+		hm.unlockedDisestablishVpnAddrRelayFor(hostinfo)
+	}
+	// Clean up any local relay indexes for which I am acting as a relay hop
 	for _, localRelayIdx := range hostinfo.relayState.CopyRelayForIdxs() {
 		delete(hm.Relays, localRelayIdx)
 	}
@@ -468,6 +510,27 @@ func (hm *HostMap) QueryVpnIpRelayFor(targetIp, relayHostIp netip.Addr) (*HostIn
 		h = h.next
 	}
 	return nil, nil, errors.New("unable to find host with relay")
+}
+
+func (hm *HostMap) unlockedDisestablishVpnAddrRelayFor(hi *HostInfo) {
+	for _, relayHostIp := range hi.relayState.CopyRelayIps() {
+		if h, ok := hm.Hosts[relayHostIp]; ok {
+			for h != nil {
+				h.relayState.UpdateRelayForByIpState(hi.vpnIp, Disestablished)
+				h = h.next
+			}
+		}
+	}
+	for _, rs := range hi.relayState.CopyAllRelayFor() {
+		if rs.Type == ForwardingType {
+			if h, ok := hm.Hosts[rs.PeerIp]; ok {
+				for h != nil {
+					h.relayState.UpdateRelayForByIpState(hi.vpnIp, Disestablished)
+					h = h.next
+				}
+			}
+		}
+	}
 }
 
 func (hm *HostMap) queryVpnIp(vpnIp netip.Addr, promoteIfce *Interface) *HostInfo {
@@ -640,13 +703,6 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote netip.AddrPort) b
 	return false
 }
 
-func (i *HostInfo) RecvErrorExceeded() bool {
-	if i.recvError.Add(1) >= maxRecvError {
-		return true
-	}
-	return true
-}
-
 func (i *HostInfo) CreateRemoteCIDR(c *cert.NebulaCertificate) {
 	if len(c.Details.Ips) == 1 && len(c.Details.Subnets) == 0 {
 		// Simple case, no CIDRTree needed
@@ -658,8 +714,7 @@ func (i *HostInfo) CreateRemoteCIDR(c *cert.NebulaCertificate) {
 		//TODO: IPV6-WORK what to do when ip is invalid?
 		nip, _ := netip.AddrFromSlice(ip.IP)
 		nip = nip.Unmap()
-		bits, _ := ip.Mask.Size()
-		remoteCidr.Insert(netip.PrefixFrom(nip, bits), struct{}{})
+		remoteCidr.Insert(netip.PrefixFrom(nip, nip.BitLen()), struct{}{})
 	}
 
 	for _, n := range c.Details.Subnets {
