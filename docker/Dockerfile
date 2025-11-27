@@ -1,11 +1,14 @@
 FROM gcr.io/distroless/static:latest
 
 ARG TARGETOS TARGETARCH
-COPY build/$TARGETOS-$TARGETARCH/nebula /nebula
-COPY build/$TARGETOS-$TARGETARCH/nebula-cert /nebula-cert
+# RUN echo $TARGETOS
+# RUN echo $TARGETARCH
+
+COPY build/$TARGETOS-$TARGETARCH/oneclick-mesh-client /oneclick-mesh-client
+COPY build/$TARGETOS-$TARGETARCH/oneclick-mesh-client-cert /oneclick-mesh-client-cert
 
 VOLUME ["/config"]
 
-ENTRYPOINT ["/nebula"]
+ENTRYPOINT ["/oneclick-mesh-client"]
 # Allow users to override the args passed to nebula
 CMD ["-config", "/config/config.yml"]
